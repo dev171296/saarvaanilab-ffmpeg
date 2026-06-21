@@ -1,5 +1,5 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List
 import subprocess
@@ -10,6 +10,7 @@ import shutil
 import logging
 import urllib.parse
 import time
+import random
 import concurrent.futures
 
 logging.basicConfig(level=logging.INFO)
@@ -22,12 +23,12 @@ class VideoRequest(BaseModel):
     image_prompts: List[str]       # 7 image prompts (raw text, service encodes)
     audio_url: str                  # Google Drive webContentLink for the MP3
     video_number: str               # e.g. "001"
-    duration_per_image: float = 9.0   # seconds per image (reduced for faster FFmpeg)
+    duration_per_image: float = 7.5   # seconds per image
 
 
 @app.get("/")
 def root():
-    return {"status": "alive", "service": "SaarVaaniLab FFmpeg", "version": "1.1"}
+    return {"status": "alive", "service": "SaarVaaniLab FFmpeg", "version": "1.2"}
 
 
 @app.get("/ping")
@@ -38,19 +39,20 @@ def ping():
 def _download_single_image(args):
     """Download one image from Pollinations — called inside a thread pool."""
     i, prompt, work_dir = args
-    # Stagger start times so threads don't all hit Pollinations simultaneously
-    time.sleep(i * 1.5)
+    # Tiny random jitter; max_workers=3 already limits concurrency
+    time.sleep(random.uniform(0, 0.5))
     seed = 1001 + i
     encoded = urllib.parse.quote(prompt)
+    # 720×1280 saves ~56% memory vs 1080×1920; still fine for Reels/Shorts
     url = (
         f"https://image.pollinations.ai/prompt/{encoded}"
-        f"?width=1080&height=1920&model=flux&seed={seed}"
+        f"?width=720&height=1280&model=flux&seed={seed}"
     )
     for attempt in range(4):
         try:
             r = requests.get(url, timeout=90)
             if r.status_code == 429:
-                wait = 20 * (attempt + 1)   # 20s, 40s, 60s
+                wait = 10 * (attempt + 1)   # 10s, 20s, 30s
                 logger.info(f"  Image {i+1} rate-limited (429), retrying in {wait}s …")
                 time.sleep(wait)
                 continue
@@ -67,15 +69,13 @@ def _download_single_image(args):
 
 
 @app.post("/assemble")
-async def assemble_video(req: VideoRequest):
+async def assemble_video(req: VideoRequest, background_tasks: BackgroundTasks):
     work_dir = tempfile.mkdtemp()
     t0 = time.time()
     logger.info(f"[{req.video_number}] Starting assembly in {work_dir}")
 
     try:
-        # ── Step 1: Download all 7 images IN PARALLEL ──────────────────────────
-        # Sequential downloads took ~90-120s, hitting Cloudflare's ~100s proxy
-        # timeout → 502. Parallel downloads finish in ~20-30s.
+        # ── Step 1: Download all images IN PARALLEL ────────────────────────────
         logger.info(f"[{req.video_number}] Downloading {len(req.image_prompts)} images in parallel …")
         t1 = time.time()
 
@@ -89,7 +89,7 @@ async def assemble_video(req: VideoRequest):
                 except RuntimeError as e:
                     raise HTTPException(status_code=502, detail=str(e))
 
-        results.sort(key=lambda x: x[0])           # ensure correct scene order 0-6
+        results.sort(key=lambda x: x[0])
         image_paths = [path for _, path in results]
         logger.info(f"[{req.video_number}] All images done in {time.time()-t1:.1f}s")
 
@@ -97,7 +97,6 @@ async def assemble_video(req: VideoRequest):
         logger.info(f"[{req.video_number}] Downloading audio …")
         audio_url = req.audio_url
 
-        # Normalise Google Drive URLs to direct download
         if "drive.google.com" in audio_url:
             if "/file/d/" in audio_url:
                 file_id = audio_url.split("/file/d/")[1].split("/")[0]
@@ -110,7 +109,6 @@ async def assemble_video(req: VideoRequest):
 
         session = requests.Session()
         r = session.get(audio_url, timeout=60, allow_redirects=True)
-        # Handle Google Drive "virus scan warning" redirect
         if b"download_warning" in r.content[:2000] or b"Google Drive" in r.content[:200]:
             for k, v in r.cookies.items():
                 if "download_warning" in k:
@@ -124,27 +122,24 @@ async def assemble_video(req: VideoRequest):
 
         # ── Step 3: Build FFmpeg command ────────────────────────────────────────
         n = len(image_paths)
-        d = req.duration_per_image      # seconds per image (input loop)
-        fade = 0.5                       # crossfade duration in seconds
+        d = req.duration_per_image
+        fade = 0.5
         output_path = os.path.join(work_dir, f"SaarVaaniLab_{req.video_number}.mp4")
 
-        # Each image is looped for (d + 1) seconds to give xfade enough material
         input_args = []
         for img in image_paths:
             input_args += ["-loop", "1", "-t", str(d + 1.0), "-i", img]
         input_args += ["-i", audio_path]
 
-        # Scale + pad each image to exactly 1080×1920 (black bars if needed)
+        # Scale + pad to 720×1280 (9:16)
         scale_parts = []
         for i in range(n):
             scale_parts.append(
-                f"[{i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
-                f"pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,"
+                f"[{i}:v]scale=720:1280:force_original_aspect_ratio=decrease,"
+                f"pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,"
                 f"setsar=1,fps=25[s{i}]"
             )
 
-        # Xfade transitions chained together
-        # Offset formula: transition i starts at (i+1)*(d - fade)
         xfade_parts = []
         prev = "s0"
         for i in range(1, n):
@@ -162,6 +157,7 @@ async def assemble_video(req: VideoRequest):
 
         cmd = [
             "ffmpeg", "-y",
+            "-threads", "2",            # cap thread count → lower peak RAM
             *input_args,
             "-filter_complex", filter_complex,
             "-map", "[outv]",
@@ -171,8 +167,8 @@ async def assemble_video(req: VideoRequest):
             "-crf", "28",
             "-c:a", "aac",
             "-b:a", "128k",
-            "-shortest",                 # stop when audio ends
-            "-movflags", "+faststart",   # web-optimised
+            "-shortest",
+            "-movflags", "+faststart",
             output_path
         ]
 
@@ -186,22 +182,21 @@ async def assemble_video(req: VideoRequest):
             raise HTTPException(status_code=500, detail=f"FFmpeg error: {err[-800:]}")
 
         logger.info(f"[{req.video_number}] FFmpeg done in {time.time()-t2:.1f}s")
+        logger.info(f"[{req.video_number}] Total: {time.time()-t0:.1f}s")
 
-        # ── Step 4: Return the video ───────────────────────────────────────────
-        with open(output_path, "rb") as f:
-            video_bytes = f.read()
-
-        logger.info(f"[{req.video_number}] Total: {time.time()-t0:.1f}s — {len(video_bytes)//1024} KB")
-
-        return Response(
-            content=video_bytes,
+        # ── Step 4: Stream video — no f.read() into RAM ───────────────────────
+        # BackgroundTask deletes temp dir AFTER response is fully sent
+        background_tasks.add_task(shutil.rmtree, work_dir, True)
+        return FileResponse(
+            output_path,
             media_type="video/mp4",
-            headers={
-                "Content-Disposition": f'attachment; filename="SaarVaaniLab_{req.video_number}.mp4"',
-                "Content-Length": str(len(video_bytes)),
-            },
+            filename=f"SaarVaaniLab_{req.video_number}.mp4",
         )
 
-    finally:
+    except HTTPException:
         shutil.rmtree(work_dir, ignore_errors=True)
-        logger.info(f"[{req.video_number}] Temp dir cleaned up")
+        raise
+    except Exception as e:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        logger.error(f"[{req.video_number}] Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
