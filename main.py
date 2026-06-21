@@ -28,7 +28,7 @@ class VideoRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "alive", "service": "SaarVaaniLab FFmpeg", "version": "1.2"}
+    return {"status": "alive", "service": "SaarVaaniLab FFmpeg", "version": "1.3"}
 
 
 @app.get("/ping")
@@ -39,11 +39,9 @@ def ping():
 def _download_single_image(args):
     """Download one image from Pollinations — called inside a thread pool."""
     i, prompt, work_dir = args
-    # Tiny random jitter; max_workers=3 already limits concurrency
-    time.sleep(random.uniform(0, 0.5))
+    time.sleep(random.uniform(0, 0.5))   # tiny jitter to spread requests
     seed = 1001 + i
     encoded = urllib.parse.quote(prompt)
-    # 720×1280 saves ~56% memory vs 1080×1920; still fine for Reels/Shorts
     url = (
         f"https://image.pollinations.ai/prompt/{encoded}"
         f"?width=720&height=1280&model=flux&seed={seed}"
@@ -72,13 +70,12 @@ def _download_single_image(args):
 async def assemble_video(req: VideoRequest, background_tasks: BackgroundTasks):
     work_dir = tempfile.mkdtemp()
     t0 = time.time()
-    logger.info(f"[{req.video_number}] Starting assembly in {work_dir}")
+    logger.info(f"[{req.video_number}] Starting assembly v1.3 in {work_dir}")
 
     try:
         # ── Step 1: Download all images IN PARALLEL ────────────────────────────
-        logger.info(f"[{req.video_number}] Downloading {len(req.image_prompts)} images in parallel …")
+        logger.info(f"[{req.video_number}] Downloading {len(req.image_prompts)} images …")
         t1 = time.time()
-
         args_list = [(i, p, work_dir) for i, p in enumerate(req.image_prompts)]
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
@@ -88,15 +85,13 @@ async def assemble_video(req: VideoRequest, background_tasks: BackgroundTasks):
                     results.append(future.result())
                 except RuntimeError as e:
                     raise HTTPException(status_code=502, detail=str(e))
-
         results.sort(key=lambda x: x[0])
         image_paths = [path for _, path in results]
-        logger.info(f"[{req.video_number}] All images done in {time.time()-t1:.1f}s")
+        logger.info(f"[{req.video_number}] Images done in {time.time()-t1:.1f}s")
 
         # ── Step 2: Download audio from Google Drive ───────────────────────────
         logger.info(f"[{req.video_number}] Downloading audio …")
         audio_url = req.audio_url
-
         if "drive.google.com" in audio_url:
             if "/file/d/" in audio_url:
                 file_id = audio_url.split("/file/d/")[1].split("/")[0]
@@ -106,7 +101,6 @@ async def assemble_video(req: VideoRequest, background_tasks: BackgroundTasks):
                 file_id = None
             if file_id:
                 audio_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
-
         session = requests.Session()
         r = session.get(audio_url, timeout=60, allow_redirects=True)
         if b"download_warning" in r.content[:2000] or b"Google Drive" in r.content[:200]:
@@ -114,78 +108,71 @@ async def assemble_video(req: VideoRequest, background_tasks: BackgroundTasks):
                 if "download_warning" in k:
                     r = session.get(f"{audio_url}&confirm={v}", timeout=60)
                     break
-
         audio_path = os.path.join(work_dir, "audio.mp3")
         with open(audio_path, "wb") as f:
             f.write(r.content)
         logger.info(f"[{req.video_number}] Audio saved ({len(r.content)//1024} KB)")
 
-        # ── Step 3: Build FFmpeg command ────────────────────────────────────────
+        # ── Step 3: Encode each image to a short .ts clip (1 FFmpeg per image) ──
+        # v1.2 used 7 simultaneous inputs + 6 chained xfade → 400-600MB filter graph → OOM
+        # v1.3: one FFmpeg per image, ultrafast, 1 thread → peak ~30-50MB per call
         n = len(image_paths)
         d = req.duration_per_image
-        fade = 0.5
+        clip_paths = []
+        t2 = time.time()
+        for idx, img_path in enumerate(image_paths):
+            clip_path = os.path.join(work_dir, f"clip_{idx:02d}.ts")
+            cmd_clip = [
+                "ffmpeg", "-y",
+                "-loop", "1", "-t", str(d),
+                "-i", img_path,
+                "-vf", (
+                    "scale=720:1280:force_original_aspect_ratio=decrease,"
+                    "pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,"
+                    "setsar=1,fps=25"
+                ),
+                "-c:v", "libx264",
+                "-preset", "ultrafast",   # fastest encode, fine for Reels
+                "-crf", "28",
+                "-threads", "1",           # 1 thread per clip → low RAM
+                clip_path
+            ]
+            res = subprocess.run(cmd_clip, capture_output=True, timeout=60)
+            if res.returncode != 0:
+                err = res.stderr.decode(errors="replace")
+                raise HTTPException(status_code=500, detail=f"Clip {idx} error: {err[-600:]}")
+            clip_paths.append(clip_path)
+            logger.info(f"[{req.video_number}] Clip {idx+1}/{n} encoded")
+        logger.info(f"[{req.video_number}] All clips encoded in {time.time()-t2:.1f}s")
+
+        # ── Step 4: Write concat list ──────────────────────────────────────────
+        concat_file = os.path.join(work_dir, "concat.txt")
+        with open(concat_file, "w") as f:
+            for cp in clip_paths:
+                f.write(f"file '{cp}'\n")
+
+        # ── Step 5: Concat clips + audio (-c:v copy = no re-encode, ~2s, <50MB) ─
         output_path = os.path.join(work_dir, f"SaarVaaniLab_{req.video_number}.mp4")
-
-        input_args = []
-        for img in image_paths:
-            input_args += ["-loop", "1", "-t", str(d + 1.0), "-i", img]
-        input_args += ["-i", audio_path]
-
-        # Scale + pad to 720×1280 (9:16)
-        scale_parts = []
-        for i in range(n):
-            scale_parts.append(
-                f"[{i}:v]scale=720:1280:force_original_aspect_ratio=decrease,"
-                f"pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,"
-                f"setsar=1,fps=25[s{i}]"
-            )
-
-        xfade_parts = []
-        prev = "s0"
-        for i in range(1, n):
-            offset = round(i * (d - fade), 3)
-            out = f"xf{i}" if i < n - 1 else "outv"
-            xfade_parts.append(
-                f"[{prev}][s{i}]xfade=transition=fade:duration={fade}:offset={offset}[{out}]"
-            )
-            prev = f"xf{i}"
-
-        if n == 1:
-            filter_complex = scale_parts[0] + ";[s0]copy[outv]"
-        else:
-            filter_complex = ";".join(scale_parts) + ";" + ";".join(xfade_parts)
-
-        cmd = [
+        cmd_final = [
             "ffmpeg", "-y",
-            "-threads", "2",            # cap thread count → lower peak RAM
-            *input_args,
-            "-filter_complex", filter_complex,
-            "-map", "[outv]",
-            "-map", f"{n}:a",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "28",
-            "-c:a", "aac",
-            "-b:a", "128k",
+            "-f", "concat", "-safe", "0", "-i", concat_file,
+            "-i", audio_path,
+            "-c:v", "copy",           # stream-copy: zero re-encoding RAM
+            "-c:a", "aac", "-b:a", "128k",
             "-shortest",
             "-movflags", "+faststart",
             output_path
         ]
-
-        logger.info(f"[{req.video_number}] Running FFmpeg …")
-        t2 = time.time()
-        result = subprocess.run(cmd, capture_output=True, timeout=240)
-
-        if result.returncode != 0:
-            err = result.stderr.decode(errors="replace")
-            logger.error(f"[{req.video_number}] FFmpeg FAILED:\n{err}")
-            raise HTTPException(status_code=500, detail=f"FFmpeg error: {err[-800:]}")
-
-        logger.info(f"[{req.video_number}] FFmpeg done in {time.time()-t2:.1f}s")
+        t3 = time.time()
+        res_final = subprocess.run(cmd_final, capture_output=True, timeout=120)
+        if res_final.returncode != 0:
+            err = res_final.stderr.decode(errors="replace")
+            logger.error(f"[{req.video_number}] Concat FAILED:\n{err}")
+            raise HTTPException(status_code=500, detail=f"Concat error: {err[-800:]}")
+        logger.info(f"[{req.video_number}] Concat done in {time.time()-t3:.1f}s")
         logger.info(f"[{req.video_number}] Total: {time.time()-t0:.1f}s")
 
-        # ── Step 4: Stream video — no f.read() into RAM ───────────────────────
-        # BackgroundTask deletes temp dir AFTER response is fully sent
+        # ── Step 6: Stream video — FileResponse sends without loading into RAM ─
         background_tasks.add_task(shutil.rmtree, work_dir, True)
         return FileResponse(
             output_path,
