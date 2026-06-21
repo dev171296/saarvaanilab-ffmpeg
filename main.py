@@ -38,15 +38,22 @@ def ping():
 def _download_single_image(args):
     """Download one image from Pollinations — called inside a thread pool."""
     i, prompt, work_dir = args
+    # Stagger start times so threads don't all hit Pollinations simultaneously
+    time.sleep(i * 1.5)
     seed = 1001 + i
     encoded = urllib.parse.quote(prompt)
     url = (
         f"https://image.pollinations.ai/prompt/{encoded}"
-        f"?width=1080&height=1920&model=flux&seed={seed}&nologo=true"
+        f"?width=1080&height=1920&model=flux&seed={seed}"
     )
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             r = requests.get(url, timeout=90)
+            if r.status_code == 429:
+                wait = 20 * (attempt + 1)   # 20s, 40s, 60s
+                logger.info(f"  Image {i+1} rate-limited (429), retrying in {wait}s …")
+                time.sleep(wait)
+                continue
             r.raise_for_status()
             img_path = os.path.join(work_dir, f"img_{i:02d}.jpg")
             with open(img_path, "wb") as f:
@@ -54,9 +61,9 @@ def _download_single_image(args):
             logger.info(f"  Image {i+1} ✓ ({len(r.content)//1024} KB)")
             return i, img_path
         except Exception as e:
-            if attempt == 2:
-                raise RuntimeError(f"Image {i+1} failed after 3 attempts: {e}")
-            time.sleep(3)
+            if attempt == 3:
+                raise RuntimeError(f"Image {i+1} failed after 4 attempts: {e}")
+            time.sleep(5)
 
 
 @app.post("/assemble")
@@ -74,7 +81,7 @@ async def assemble_video(req: VideoRequest):
 
         args_list = [(i, p, work_dir) for i, p in enumerate(req.image_prompts)]
         results = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=7) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
             futures = {pool.submit(_download_single_image, a): a[0] for a in args_list}
             for future in concurrent.futures.as_completed(futures):
                 try:
