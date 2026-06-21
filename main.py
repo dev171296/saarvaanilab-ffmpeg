@@ -119,7 +119,7 @@ def root():
     return {
         "status": "alive",
         "service": "SaarVaaniLab FFmpeg",
-        "version": "1.5",
+        "version": "1.6",
         "font_ready": _font_ready(),
     }
 
@@ -162,7 +162,9 @@ def _download_single_image(args):
 async def assemble_video(req: VideoRequest, background_tasks: BackgroundTasks):
     work_dir = tempfile.mkdtemp()
     t0 = time.time()
-    logger.info(f"[{req.video_number}] v1.5 — hook_text={repr(req.hook_text[:40])} font={_font_ready()}")
+    # Decode URL-encoded hook text (Make.com encodeURL() encodes Hindi to ASCII-safe)
+    hook_text = urllib.parse.unquote(req.hook_text)
+    logger.info(f"[{req.video_number}] v1.6 — hook_text={repr(hook_text[:40])} font={_font_ready()}")
 
     try:
         # ── Step 1: Download images in parallel ────────────────────────────────
@@ -209,8 +211,8 @@ async def assemble_video(req: VideoRequest, background_tasks: BackgroundTasks):
         # One FFmpeg per image → low RAM. drawtext burns hook + branding directly.
         n = len(image_paths)
         d = req.duration_per_image
-        vf = _build_vf(req.hook_text)
-        logger.info(f"[{req.video_number}] VF filter ready (overlays={'yes' if _font_ready() and req.hook_text else 'no'})")
+        vf = _build_vf(hook_text)
+        logger.info(f"[{req.video_number}] VF filter ready (overlays={'yes' if _font_ready() and hook_text else 'no'})")
 
         clip_paths = []
         t2 = time.time()
