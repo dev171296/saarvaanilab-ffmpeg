@@ -1,9 +1,14 @@
-# Base: slim Python with FFmpeg installed via apt
+\# Base: slim Python with FFmpeg installed via apt
 FROM python:3.11-slim
 
-# Install FFmpeg
+# Install FFmpeg + wget, then download Noto Sans Devanagari Bold directly
+# (fonts-noto-core on Debian slim does not include Devanagari)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg fonts-noto-core && \
+    apt-get install -y --no-install-recommends ffmpeg wget && \
+    wget -q \
+    "https://fonts.gstatic.com/s/notosansdevanagari/v30/TuGoUUFzXI5FBtUq5a8bjKYTZjtRU6Sgv3NaV_SNmI0b8QQCQmHn6B2OHjbL_08AlZMiy-A.ttf" \
+    -O /usr/share/fonts/NotoSansDevanagari-Bold.ttf || \
+    echo "WARNING: Font download failed — text overlays will be skipped" && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
