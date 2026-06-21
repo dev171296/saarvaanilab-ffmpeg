@@ -22,6 +22,7 @@ app = FastAPI(title="SaarVaaniLab FFmpeg Service")
 # ── Font setup ─────────────────────────────────────────────────────────────────
 # fonts-noto-core is installed in Dockerfile; path on Debian/Ubuntu:
 _FONT_CANDIDATES = [
+    "/usr/share/fonts/NotoSansDevanagari-Bold.ttf",          # downloaded by Dockerfile
     "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
     "/usr/share/fonts/truetype/noto/NotoSansDevanagari[wdth,wght].ttf",
     "/usr/share/fonts/opentype/noto/NotoSansDevanagari-Bold.otf",
