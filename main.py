@@ -10,6 +10,7 @@ import shutil
 import logging
 import urllib.parse
 import time
+import concurrent.futures
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,12 +22,12 @@ class VideoRequest(BaseModel):
     image_prompts: List[str]       # 7 image prompts (raw text, service encodes)
     audio_url: str                  # Google Drive webContentLink for the MP3
     video_number: str               # e.g. "001"
-    duration_per_image: float = 10.0  # seconds per image (10s × 7 = 70s covers ~60s audio)
+    duration_per_image: float = 9.0   # seconds per image (reduced for faster FFmpeg)
 
 
 @app.get("/")
 def root():
-    return {"status": "alive", "service": "SaarVaaniLab FFmpeg", "version": "1.0"}
+    return {"status": "alive", "service": "SaarVaaniLab FFmpeg", "version": "1.1"}
 
 
 @app.get("/ping")
@@ -34,41 +35,56 @@ def ping():
     return {"pong": True}
 
 
-@app.post("/assemble")
-async def assemble_video(req: VideoRequest):
-    work_dir = tempfile.mkdtemp()
-    logger.info(f"[{req.video_number}] Starting assembly in {work_dir}")
-
-    try:
-        # ── Step 1: Download images from Pollinations ──────────────────────────
-        image_paths = []
-        for i, prompt in enumerate(req.image_prompts):
-            seed = 1001 + i
-            encoded = urllib.parse.quote(prompt)
-            url = (
-                f"https://image.pollinations.ai/prompt/{encoded}"
-                f"&width=1080&height=1920&model=flux&seed={seed}"
-            )
-            logger.info(f"[{req.video_number}] Downloading image {i+1}/7 …")
-            for attempt in range(3):
-                try:
-                    r = requests.get(url, timeout=90)
-                    r.raise_for_status()
-                    break
-                except Exception as e:
-                    if attempt == 2:
-                        raise HTTPException(
-                            status_code=502,
-                            detail=f"Image {i+1} download failed after 3 attempts: {e}"
-                        )
-                    time.sleep(5)
+def _download_single_image(args):
+    """Download one image from Pollinations — called inside a thread pool."""
+    i, prompt, work_dir = args
+    seed = 1001 + i
+    encoded = urllib.parse.quote(prompt)
+    url = (
+        f"https://image.pollinations.ai/prompt/{encoded}"
+        f"?width=1080&height=1920&model=flux&seed={seed}&nologo=true"
+    )
+    for attempt in range(3):
+        try:
+            r = requests.get(url, timeout=90)
+            r.raise_for_status()
             img_path = os.path.join(work_dir, f"img_{i:02d}.jpg")
             with open(img_path, "wb") as f:
                 f.write(r.content)
-            image_paths.append(img_path)
-            logger.info(f"[{req.video_number}] Image {i+1} saved ({len(r.content)//1024} KB)")
-            if i < len(req.image_prompts) - 1:
-                time.sleep(3)  # rate-limit buffer
+            logger.info(f"  Image {i+1} ✓ ({len(r.content)//1024} KB)")
+            return i, img_path
+        except Exception as e:
+            if attempt == 2:
+                raise RuntimeError(f"Image {i+1} failed after 3 attempts: {e}")
+            time.sleep(3)
+
+
+@app.post("/assemble")
+async def assemble_video(req: VideoRequest):
+    work_dir = tempfile.mkdtemp()
+    t0 = time.time()
+    logger.info(f"[{req.video_number}] Starting assembly in {work_dir}")
+
+    try:
+        # ── Step 1: Download all 7 images IN PARALLEL ──────────────────────────
+        # Sequential downloads took ~90-120s, hitting Cloudflare's ~100s proxy
+        # timeout → 502. Parallel downloads finish in ~20-30s.
+        logger.info(f"[{req.video_number}] Downloading {len(req.image_prompts)} images in parallel …")
+        t1 = time.time()
+
+        args_list = [(i, p, work_dir) for i, p in enumerate(req.image_prompts)]
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=7) as pool:
+            futures = {pool.submit(_download_single_image, a): a[0] for a in args_list}
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    results.append(future.result())
+                except RuntimeError as e:
+                    raise HTTPException(status_code=502, detail=str(e))
+
+        results.sort(key=lambda x: x[0])           # ensure correct scene order 0-6
+        image_paths = [path for _, path in results]
+        logger.info(f"[{req.video_number}] All images done in {time.time()-t1:.1f}s")
 
         # ── Step 2: Download audio from Google Drive ───────────────────────────
         logger.info(f"[{req.video_number}] Downloading audio …")
@@ -154,18 +170,21 @@ async def assemble_video(req: VideoRequest):
         ]
 
         logger.info(f"[{req.video_number}] Running FFmpeg …")
-        result = subprocess.run(cmd, capture_output=True, timeout=300)
+        t2 = time.time()
+        result = subprocess.run(cmd, capture_output=True, timeout=240)
 
         if result.returncode != 0:
             err = result.stderr.decode(errors="replace")
             logger.error(f"[{req.video_number}] FFmpeg FAILED:\n{err}")
             raise HTTPException(status_code=500, detail=f"FFmpeg error: {err[-800:]}")
 
+        logger.info(f"[{req.video_number}] FFmpeg done in {time.time()-t2:.1f}s")
+
         # ── Step 4: Return the video ───────────────────────────────────────────
         with open(output_path, "rb") as f:
             video_bytes = f.read()
 
-        logger.info(f"[{req.video_number}] Done — {len(video_bytes)//1024} KB")
+        logger.info(f"[{req.video_number}] Total: {time.time()-t0:.1f}s — {len(video_bytes)//1024} KB")
 
         return Response(
             content=video_bytes,
