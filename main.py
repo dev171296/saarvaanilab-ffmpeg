@@ -140,7 +140,7 @@ def root():
     return {
         "status": "alive",
         "service": "SaarVaaniLab FFmpeg",
-        "version": "1.8",
+        "version": "1.9",
         "font_ready": _font_ready(),
     }
 
@@ -154,7 +154,16 @@ def _download_single_image(args):
     i, prompt, work_dir = args
     time.sleep(random.uniform(0, 0.5))
     seed = 1001 + i
-    encoded = urllib.parse.quote(prompt)
+    # Mandatory modesty + style prefix prepended to EVERY prompt (positive prompt carries more
+    # weight than negative in FLUX — this is the primary safety layer)
+    modesty_prefix = (
+        "hyper-realistic cinematic 4K Ramayana ancient India, "
+        "fully draped traditional silk saree with dupatta covering shoulders and chest, "
+        "high neckline, completely covered modest dignified attire, "
+        "devotional respectful depiction, no bare skin visible, "
+        "no cleavage, no revealing clothing, "
+    )
+    encoded = urllib.parse.quote(modesty_prefix + prompt)
     negative = urllib.parse.quote(
         "cleavage,revealing clothes,bare skin,low cut neckline,sexual,nsfw,nude,semi-nude,"
         "inappropriate,modern clothing,western outfit,bikini,lingerie,exposed midriff,"
@@ -190,7 +199,7 @@ async def assemble_video(req: VideoRequest, background_tasks: BackgroundTasks):
     t0 = time.time()
     # Decode URL-encoded hook text (Make.com encodeURL() encodes Hindi to ASCII-safe)
     hook_text = urllib.parse.unquote(req.hook_text)
-    logger.info(f"[{req.video_number}] v1.8 — hook_text={repr(hook_text[:40])} font={_font_ready()}")
+    logger.info(f"[{req.video_number}] v1.9 — hook_text={repr(hook_text[:40])} font={_font_ready()}")
 
     try:
         # ── Step 1: Download images in parallel ────────────────────────────────
