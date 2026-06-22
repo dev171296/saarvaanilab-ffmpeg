@@ -140,7 +140,7 @@ def root():
     return {
         "status": "alive",
         "service": "SaarVaaniLab FFmpeg",
-        "version": "1.9",
+        "version": "2.0",
         "font_ready": _font_ready(),
     }
 
@@ -158,14 +158,17 @@ def _download_single_image(args):
     # weight than negative in FLUX — this is the primary safety layer)
     modesty_prefix = (
         "hyper-realistic cinematic 4K Ramayana ancient India, "
-        "fully draped traditional silk saree with dupatta covering shoulders and chest, "
-        "high neckline, completely covered modest dignified attire, "
+        "fully draped traditional silk saree with dupatta fully covering shoulders chest and neckline, "
+        "high closed neckline no deep neck no low cut no V-neck, "
+        "completely covered modest dignified attire, "
         "devotional respectful depiction, no bare skin visible, "
-        "no cleavage, no revealing clothing, "
+        "no cleavage no deep neckline no revealing clothing, "
+        "fully clothed traditional Indian woman conservative modest dress, "
     )
     encoded = urllib.parse.quote(modesty_prefix + prompt)
     negative = urllib.parse.quote(
-        "cleavage,revealing clothes,bare skin,low cut neckline,sexual,nsfw,nude,semi-nude,"
+        "cleavage,deep neck,deep neckline,deep V-neck,low cut neckline,off shoulder,"
+        "revealing clothes,bare skin,bare chest,bare shoulders,sexual,nsfw,nude,semi-nude,"
         "inappropriate,modern clothing,western outfit,bikini,lingerie,exposed midriff,"
         "tight clothes,skimpy,provocative pose,ugly,deformed,blurry,watermark"
     )
@@ -199,7 +202,7 @@ async def assemble_video(req: VideoRequest, background_tasks: BackgroundTasks):
     t0 = time.time()
     # Decode URL-encoded hook text (Make.com encodeURL() encodes Hindi to ASCII-safe)
     hook_text = urllib.parse.unquote(req.hook_text)
-    logger.info(f"[{req.video_number}] v1.9 — hook_text={repr(hook_text[:40])} font={_font_ready()}")
+    logger.info(f"[{req.video_number}] v2.0 — hook_text={repr(hook_text[:40])} font={_font_ready()}")
 
     try:
         # ── Step 1: Download images in parallel ────────────────────────────────
