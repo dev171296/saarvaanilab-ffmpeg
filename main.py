@@ -140,7 +140,7 @@ def root():
     return {
         "status": "alive",
         "service": "SaarVaaniLab FFmpeg",
-        "version": "2.1",
+        "version": "2.2",
         "font_ready": _font_ready(),
     }
 
@@ -150,44 +150,20 @@ def ping():
     return {"pong": True}
 
 
-FEMALE_KEYWORDS = {
-    "sita", "kaikeyi", "mandodari", "urmila", "surpanakha", "tara", "sulochana",
-    "woman", "women", "female", "goddess", "devi", "apsara", "queen", "princess",
-    "wife", "mother", "sister", "daughter", "lady", "ladies",
-    "माता", "देवी", "रानी", "पत्नी", "स्त्री", "नारी",
-}
-
-def _is_female_scene(prompt: str) -> bool:
-    lower = prompt.lower()
-    return any(kw in lower for kw in FEMALE_KEYWORDS)
-
-
 def _download_single_image(args):
     i, prompt, work_dir = args
     time.sleep(random.uniform(0, 0.5))
     seed = 1001 + i
 
-    # Base style prefix — always applied
+    # Minimal cinematic style prefix — no gender or character assumptions
     style_prefix = (
-        "hyper-realistic cinematic 4K ancient India Ramayana era, "
-        "historically accurate traditional Indian clothing, "
-        "devotional respectful depiction, no modern clothing, "
+        "photorealistic cinematic 4K ultra-detailed, "
+        "ancient India Ramayana era, "
+        "traditional period-accurate setting and clothing, "
+        "dramatic cinematic lighting, "
     )
 
-    # Female modesty additions — only for scenes with female characters
-    if _is_female_scene(prompt):
-        female_prefix = (
-            "fully draped traditional silk saree with dupatta fully covering shoulders chest and neckline, "
-            "high closed neckline no deep neck no low cut no V-neck, "
-            "completely covered modest dignified attire, no bare skin visible, "
-            "no cleavage no deep neckline no revealing clothing, "
-            "fully clothed traditional Indian woman conservative modest dress, "
-        )
-        full_prefix = style_prefix + female_prefix
-    else:
-        full_prefix = style_prefix
-
-    encoded = urllib.parse.quote(full_prefix + prompt)
+    encoded = urllib.parse.quote(style_prefix + prompt)
     negative = urllib.parse.quote(
         "cleavage,deep neck,deep neckline,deep V-neck,low cut neckline,off shoulder,"
         "revealing clothes,bare skin,bare chest,bare shoulders,sexual,nsfw,nude,semi-nude,"
@@ -224,7 +200,7 @@ async def assemble_video(req: VideoRequest, background_tasks: BackgroundTasks):
     t0 = time.time()
     # Decode URL-encoded hook text (Make.com encodeURL() encodes Hindi to ASCII-safe)
     hook_text = urllib.parse.unquote(req.hook_text)
-    logger.info(f"[{req.video_number}] v2.1 — hook_text={repr(hook_text[:40])} font={_font_ready()}")
+    logger.info(f"[{req.video_number}] v2.2 — hook_text={repr(hook_text[:40])} font={_font_ready()}")
 
     try:
         # ── Step 1: Download images in parallel ────────────────────────────────
