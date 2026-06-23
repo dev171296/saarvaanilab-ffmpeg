@@ -1,0 +1,31 @@
+name: Wake Render Before Daily Run
+
+# Pings the FFmpeg service at 8:50 AM IST (03:20 UTC) every day
+# Make.com Scenario 1 runs at 9:00 AM IST (03:30 UTC)
+# Render free tier sleeps after 15 min of inactivity — this keeps it warm
+
+on:
+  schedule:
+    - cron: '20 3 * * *'   # 03:20 UTC = 8:50 AM IST
+  workflow_dispatch:         # allow manual trigger from GitHub Actions UI
+
+jobs:
+  wake-render:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render service
+        run: |
+          echo "Pinging Render at $(date -u) UTC (8:50 AM IST)..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://saarvaanilab-ffmpeg.onrender.com/ping)
+          echo "HTTP status: $STATUS"
+          if [ "$STATUS" = "200" ]; then
+            echo "✓ Render is awake and ready"
+          else
+            echo "⚠ Unexpected status $STATUS — Render may still be starting"
+          fi
+
+      - name: Second ping (confirm warm)
+        run: |
+          sleep 30
+          echo "Confirming warm at $(date -u) UTC..."
+          curl -sf https://saarvaanilab-ffmpeg.onrender.com/ | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'✓ Service alive — version {d[\"version\"]}, font_ready={d[\"font_ready\"]}')"
