@@ -183,6 +183,10 @@ def _download_single_image(args):
                 time.sleep(wait)
                 continue
             r.raise_for_status()
+            if len(r.content) < 5000:
+                logger.warning(f"  Image {i+1} empty ({len(r.content)} bytes) — retry {attempt+1}/4")
+                time.sleep(10 * (attempt + 1))
+                continue
             img_path = os.path.join(work_dir, f"img_{i:02d}.jpg")
             with open(img_path, "wb") as f:
                 f.write(r.content)
