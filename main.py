@@ -153,7 +153,7 @@ def ping():
 def _download_single_image(args):
     i, prompt, work_dir = args
     time.sleep(random.uniform(0, 0.5))
-    seed = 1001 + i
+    seed = 42000 + i
 
     # Minimal cinematic style prefix — no gender or character assumptions
     style_prefix = (
