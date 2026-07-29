@@ -155,7 +155,7 @@ def root():
     return {
         "status": "alive",
         "service": "SaarVaaniLab FFmpeg",
-        "version": "2.5",
+        "version": "2.6",
         "font_ready": _font_ready(),
     }
 
@@ -169,13 +169,27 @@ def ping():
 # Replaces the old Azure TTS. No API key, no cost. hi-IN-MadhurNeural = male Hindi
 # voice (closest free twin of Azure's Kunal). hi-IN-SwaraNeural = female Hindi voice.
 
+# Broadcast "narrator polish" chain — tuned for the +8% faster read:
+# warmth back in, presence eased so consonants aren't harsh, sibilance tamed,
+# gentle compression for a produced feel, consistent -15 LUFS loudness.
+AUDIO_POLISH = (
+    "highpass=f=85,"
+    "equalizer=f=170:t=q:w=1.0:g=2.5,"
+    "equalizer=f=3500:t=q:w=1.5:g=2,"
+    "equalizer=f=6500:t=q:w=2.0:g=-2,"
+    "acompressor=threshold=-18dB:ratio=3:attack=10:release=180,"
+    "loudnorm=I=-15:TP=-1.5:LRA=11"
+)
+
+
 class TTSRequest(BaseModel):
     text: str = ""       # optional: full text directly
     hook: str = ""       # optional: hook line (spoken first)
     script: str = ""     # optional: full script (spoken after hook)
     voice: str = "hi-IN-MadhurNeural"
-    rate: str = "+0%"    # e.g. "-10%" slower, "+10%" faster
-    pitch: str = "+0Hz"  # e.g. "-2Hz" lower, "+2Hz" higher
+    rate: str = "+8%"    # faster, punchier pacing (good for reel retention)
+    pitch: str = "-3Hz"  # slightly deeper for narrator gravitas
+    polish: bool = True  # apply the FFmpeg broadcast polish chain
     url_encoded: bool = True   # Make sends fields URL-encoded to keep JSON valid
 
 
@@ -198,22 +212,40 @@ async def tts(req: TTSRequest, background_tasks: BackgroundTasks):
     if not text:
         raise HTTPException(status_code=400, detail="No text provided for TTS")
 
-    logger.info(f"[TTS] voice={req.voice} rate={req.rate} pitch={req.pitch} chars={len(text)}")
+    logger.info(f"[TTS] voice={req.voice} rate={req.rate} pitch={req.pitch} polish={req.polish} chars={len(text)}")
     work_dir = tempfile.mkdtemp()
+    raw_path = os.path.join(work_dir, "voice_raw.mp3")
     out_path = os.path.join(work_dir, "voice.mp3")
 
     try:
         communicate = edge_tts.Communicate(
             text, req.voice, rate=req.rate, pitch=req.pitch
         )
-        await communicate.save(out_path)
+        await communicate.save(raw_path)
 
-        if not os.path.exists(out_path) or os.path.getsize(out_path) < 1000:
+        if not os.path.exists(raw_path) or os.path.getsize(raw_path) < 1000:
             raise HTTPException(status_code=502, detail="TTS produced empty audio")
 
-        logger.info(f"[TTS] Audio ready ({os.path.getsize(out_path)//1024} KB)")
+        # ── Broadcast polish pass (EQ + compression + loudness) ──────────────
+        final_path = raw_path
+        if req.polish:
+            cmd = [
+                "ffmpeg", "-y", "-i", raw_path,
+                "-af", AUDIO_POLISH,
+                "-c:a", "libmp3lame", "-b:a", "128k",
+                out_path,
+            ]
+            res = subprocess.run(cmd, capture_output=True, timeout=120)
+            if res.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+                final_path = out_path
+            else:
+                # Never fail the whole request over polish — fall back to raw audio
+                err = res.stderr.decode(errors="replace")[-400:]
+                logger.error(f"[TTS] Polish failed, returning raw audio. {err}")
+
+        logger.info(f"[TTS] Audio ready ({os.path.getsize(final_path)//1024} KB, polished={final_path==out_path})")
         background_tasks.add_task(shutil.rmtree, work_dir, True)
-        return FileResponse(out_path, media_type="audio/mpeg", filename="voice.mp3")
+        return FileResponse(final_path, media_type="audio/mpeg", filename="voice.mp3")
 
     except HTTPException:
         shutil.rmtree(work_dir, ignore_errors=True)
