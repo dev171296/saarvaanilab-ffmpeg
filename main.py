@@ -12,6 +12,7 @@ import urllib.parse
 import time
 import random
 import concurrent.futures
+import edge_tts
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -148,6 +149,51 @@ def root():
 @app.get("/ping")
 def ping():
     return {"pong": True}
+
+
+# ── Text-to-Speech (free, edge-tts / Microsoft neural voices) ────────────────────
+# Replaces the old Azure TTS. No API key, no cost. hi-IN-MadhurNeural = male Hindi
+# voice (closest free twin of Azure's Kunal). hi-IN-SwaraNeural = female Hindi voice.
+
+class TTSRequest(BaseModel):
+    text: str
+    voice: str = "hi-IN-MadhurNeural"
+    rate: str = "+0%"      # e.g. "-10%" slower, "+10%" faster
+    pitch: str = "+0Hz"    # e.g. "-2Hz" lower, "+2Hz" higher
+    decode_url: bool = False   # set true if Make sends the text URL-encoded
+
+
+@app.post("/tts")
+async def tts(req: TTSRequest, background_tasks: BackgroundTasks):
+    text = urllib.parse.unquote(req.text) if req.decode_url else req.text
+    text = (text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="No text provided for TTS")
+
+    logger.info(f"[TTS] voice={req.voice} rate={req.rate} pitch={req.pitch} chars={len(text)}")
+    work_dir = tempfile.mkdtemp()
+    out_path = os.path.join(work_dir, "voice.mp3")
+
+    try:
+        communicate = edge_tts.Communicate(
+            text, req.voice, rate=req.rate, pitch=req.pitch
+        )
+        await communicate.save(out_path)
+
+        if not os.path.exists(out_path) or os.path.getsize(out_path) < 1000:
+            raise HTTPException(status_code=502, detail="TTS produced empty audio")
+
+        logger.info(f"[TTS] Audio ready ({os.path.getsize(out_path)//1024} KB)")
+        background_tasks.add_task(shutil.rmtree, work_dir, True)
+        return FileResponse(out_path, media_type="audio/mpeg", filename="voice.mp3")
+
+    except HTTPException:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise
+    except Exception as e:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        logger.error(f"[TTS] Failed: {e}")
+        raise HTTPException(status_code=500, detail=f"TTS error: {e}")
 
 
 def _download_single_image(args):
