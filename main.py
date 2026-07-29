@@ -141,7 +141,7 @@ def root():
     return {
         "status": "alive",
         "service": "SaarVaaniLab FFmpeg",
-        "version": "2.2",
+        "version": "2.4",
         "font_ready": _font_ready(),
     }
 
@@ -156,17 +156,31 @@ def ping():
 # voice (closest free twin of Azure's Kunal). hi-IN-SwaraNeural = female Hindi voice.
 
 class TTSRequest(BaseModel):
-    text: str
+    text: str = ""       # optional: full text directly
+    hook: str = ""       # optional: hook line (spoken first)
+    script: str = ""     # optional: full script (spoken after hook)
     voice: str = "hi-IN-MadhurNeural"
-    rate: str = "+0%"      # e.g. "-10%" slower, "+10%" faster
-    pitch: str = "+0Hz"    # e.g. "-2Hz" lower, "+2Hz" higher
-    decode_url: bool = False   # set true if Make sends the text URL-encoded
+    rate: str = "+0%"    # e.g. "-10%" slower, "+10%" faster
+    pitch: str = "+0Hz"  # e.g. "-2Hz" lower, "+2Hz" higher
+    url_encoded: bool = True   # Make sends fields URL-encoded to keep JSON valid
 
 
 @app.post("/tts")
 async def tts(req: TTSRequest, background_tasks: BackgroundTasks):
-    text = urllib.parse.unquote(req.text) if req.decode_url else req.text
-    text = (text or "").strip()
+    def _dec(s: str) -> str:
+        return urllib.parse.unquote(s or "") if req.url_encoded else (s or "")
+
+    if req.text:
+        text = _dec(req.text).strip()
+    else:
+        hook = _dec(req.hook).strip()
+        script = _dec(req.script).strip()
+        if hook and script:
+            text = f"{hook}। {script}"
+        else:
+            text = hook or script
+        text = text.strip()
+
     if not text:
         raise HTTPException(status_code=400, detail="No text provided for TTS")
 
