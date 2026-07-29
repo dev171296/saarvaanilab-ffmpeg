@@ -13,6 +13,7 @@ import time
 import random
 import concurrent.futures
 import edge_tts
+from PIL import Image, ImageDraw, ImageFont
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -71,40 +72,53 @@ def _wrap_hook(text: str, max_chars: int = 14) -> str:
     return "\n".join(lines)
 
 
-def _build_vf_hook(hook_text: str) -> str:
-    """VF filter for Scene 1 — base scale + hook text overlay + branding."""
-    base = (
-        "scale=720:1280:force_original_aspect_ratio=decrease,"
-        "pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,"
-        "setsar=1,fps=25"
-    )
+def _render_hook_png(hook_text: str, work_dir: str):
+    """Render the centered hook text to a transparent 720x1280 PNG using Pillow +
+    RAQM shaping. FFmpeg's drawtext lacks HarfBuzz in this build, so it mis-places
+    Devanagari matras (e.g. फिर -> फरि). Pillow+RAQM reorders them correctly.
+    Returns the PNG path, or None if there's no hook / the font isn't ready."""
     if not hook_text or not _font_ready():
-        logger.warning("Overlays skipped — font not ready or hook_text empty")
-        return base
+        logger.warning("Hook overlay skipped — font not ready or hook_text empty")
+        return None
 
-    wrapped = _wrap_hook(hook_text)
-    with open(HOOK_TEXT_FILE, "w", encoding="utf-8") as f:
-        f.write(wrapped)
-    logger.info(f"Hook text written ({len(wrapped)} chars, {wrapped.count(chr(10))+1} lines)")
+    W, H = 720, 1280
+    lines = _wrap_hook(hook_text).split("\n")
+    try:
+        font = ImageFont.truetype(FONT_PATH, 64, layout_engine=ImageFont.Layout.RAQM)
+    except Exception:
+        # Fallback: default layout (still shapes if Pillow's default is RAQM-capable)
+        font = ImageFont.truetype(FONT_PATH, 64)
 
-    # Cinematic centered hook — large, dominant, screen-filling
-    hook_dt = (
-        f"drawtext=fontfile={FONT_PATH}"
-        f":textfile={HOOK_TEXT_FILE}"
-        f":fontcolor=white:fontsize=64"
-        f":x=(w-text_w)/2:y=(h-text_h)/2"
-        f":shadowcolor=black@0.9:shadowx=3:shadowy=3"
-        f":box=1:boxcolor=black@0.60:boxborderw=22"
-        f":line_spacing=12"
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    line_spacing = 12
+    ascent, descent = font.getmetrics()
+    line_h = ascent + descent
+    widths = [draw.textbbox((0, 0), ln, font=font)[2] for ln in lines]
+    block_w = max(widths) if widths else 0
+    block_h = line_h * len(lines) + line_spacing * (len(lines) - 1)
+
+    pad = 22
+    draw.rectangle(
+        [(W - block_w) // 2 - pad, (H - block_h) // 2 - pad,
+         (W + block_w) // 2 + pad, (H + block_h) // 2 + pad],
+        fill=(0, 0, 0, 153),  # black @ 0.60
     )
-    brand_dt = (
-        f"drawtext=fontfile={FONT_PATH}"
-        f":text=SaarVaaniLab"
-        f":fontcolor=yellow:fontsize=24"
-        f":x=w-text_w-15:y=15"
-        f":box=1:boxcolor=black@0.45:boxborderw=8"
-    )
-    return f"{base},{hook_dt},{brand_dt}"
+
+    y = (H - block_h) // 2
+    for ln in lines:
+        w = draw.textbbox((0, 0), ln, font=font)[2]
+        x = (W - w) // 2
+        draw.text((x + 3, y + 3), ln, font=font, fill=(0, 0, 0, 230))  # shadow
+        draw.text((x, y), ln, font=font, fill=(255, 255, 255, 255))    # text
+        y += line_h + line_spacing
+
+    out = os.path.join(work_dir, "hook_overlay.png")
+    img.save(out)
+    img.close()
+    logger.info(f"Hook PNG rendered ({len(lines)} lines) -> {out}")
+    return out
 
 
 def _build_vf_plain() -> str:
@@ -141,7 +155,7 @@ def root():
     return {
         "status": "alive",
         "service": "SaarVaaniLab FFmpeg",
-        "version": "2.4",
+        "version": "2.5",
         "font_ready": _font_ready(),
     }
 
@@ -327,27 +341,44 @@ async def assemble_video(req: VideoRequest, background_tasks: BackgroundTasks):
             logger.warning(f"[{req.video_number}] ffprobe failed, using default {d}s/clip")
 
         # ── Step 4: Encode each image to clip ─────────────────────────────────
-        # Scene 1 gets hook text overlay; Scenes 2-7 get branding only.
-        vf_hook = _build_vf_hook(hook_text)
+        # Scene 1 gets the hook text as a properly-shaped PNG overlay; Scenes 2-7
+        # get branding only.
+        hook_png = _render_hook_png(hook_text, work_dir)
         vf_plain = _build_vf_plain()
-        logger.info(f"[{req.video_number}] VF filters ready (hook={'yes' if _font_ready() and hook_text else 'no'})")
+        logger.info(f"[{req.video_number}] Overlay ready (hook={'yes' if hook_png else 'no'})")
 
         clip_paths = []
         t2 = time.time()
         for idx, img_path in enumerate(image_paths):
             clip_path = os.path.join(work_dir, f"clip_{idx:02d}.ts")
-            vf = vf_hook if idx == 0 else vf_plain
-            cmd_clip = [
-                "ffmpeg", "-y",
-                "-loop", "1", "-t", str(d),
-                "-i", img_path,
-                "-vf", vf,
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-crf", "28",
-                "-threads", "1",
-                clip_path
-            ]
+            if idx == 0 and hook_png:
+                # scale/pad/brand the image, then overlay the shaped hook PNG on top
+                cmd_clip = [
+                    "ffmpeg", "-y",
+                    "-loop", "1", "-t", str(d),
+                    "-i", img_path,
+                    "-i", hook_png,
+                    "-filter_complex",
+                    f"[0:v]{vf_plain}[bg];[bg][1:v]overlay=0:0[out]",
+                    "-map", "[out]",
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-crf", "28",
+                    "-threads", "1",
+                    clip_path
+                ]
+            else:
+                cmd_clip = [
+                    "ffmpeg", "-y",
+                    "-loop", "1", "-t", str(d),
+                    "-i", img_path,
+                    "-vf", vf_plain,
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-crf", "28",
+                    "-threads", "1",
+                    clip_path
+                ]
             res = subprocess.run(cmd_clip, capture_output=True, timeout=60)
             if res.returncode != 0:
                 err = res.stderr.decode(errors="replace")
